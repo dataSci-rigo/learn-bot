@@ -1,0 +1,190 @@
+"""
+Scheduled job callbacks. All four are called by the JobQueue.
+They are also called during rehydration on startup (bot.py).
+"""
+import logging
+from datetime import datetime, timezone, timedelta
+
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ContextTypes
+
+import config
+import db
+
+logger = logging.getLogger(__name__)
+
+
+def _today() -> str:
+    return datetime.now(config.TZ).strftime("%Y-%m-%d")
+
+
+def _local_now() -> datetime:
+    return datetime.now(config.TZ)
+
+
+# ---------- helpers ----------
+
+def _start_ping_keyboard(task_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("Yes", callback_data=f"start_yes:{task_id}"),
+        InlineKeyboardButton(f"Snooze {config.SNOOZE_MINUTES}", callback_data=f"start_snooze:{task_id}"),
+        InlineKeyboardButton("Skip", callback_data=f"start_skip:{task_id}"),
+    ]])
+
+
+def _endpoint_keyboard(task_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("Done", callback_data=f"end_done:{task_id}"),
+        InlineKeyboardButton("More time", callback_data=f"end_more:{task_id}"),
+        InlineKeyboardButton("Stuck", callback_data=f"end_stuck:{task_id}"),
+    ]])
+
+
+def _schedule_start_ping(app, task_id: int, run_at: datetime) -> None:
+    now = datetime.now(timezone.utc)
+    delay = max((run_at - now).total_seconds(), 0)
+    app.job_queue.run_once(
+        start_ping,
+        when=delay,
+        data=task_id,
+        name=f"start_ping_{task_id}",
+    )
+
+
+def _schedule_endpoint_ping(app, task_id: int, run_at: datetime) -> None:
+    now = datetime.now(timezone.utc)
+    delay = max((run_at - now).total_seconds(), 0)
+    app.job_queue.run_once(
+        endpoint_ping,
+        when=delay,
+        data=task_id,
+        name=f"endpoint_ping_{task_id}",
+    )
+
+
+# ---------- job: morning ----------
+
+async def morning_prompt(context: ContextTypes.DEFAULT_TYPE) -> None:
+    today = _today()
+    state = db.get_day_state(today)
+    if state["silenced"] or state["morning_done"]:
+        return
+
+    db.log_event("morning_prompt")
+    await context.bot.send_message(
+        chat_id=config.CHAT_ID,
+        text=(
+            "Morning. Your 1–3 must-dos today? One per line. "
+            "Add a time like `Finish cover letter @ 10:00`. "
+            "(`/skip` to take the day off.)"
+        ),
+        parse_mode="Markdown",
+    )
+
+
+# ---------- job: start ping ----------
+
+async def start_ping(context: ContextTypes.DEFAULT_TYPE) -> None:
+    task_id: int = context.job.data
+    today = _today()
+
+    state = db.get_day_state(today)
+    if state["silenced"]:
+        return
+
+    task = db.get_task(task_id)
+    if task is None or task["status"] != "planned":
+        return  # already handled
+
+    db.log_event("start_ping", task_id=task_id)
+    minutes = task["timer_minutes"]
+    await context.bot.send_message(
+        chat_id=config.CHAT_ID,
+        text=f"{task['planned_start']} — start: {task['description']}. Begin a {minutes}-min timer?",
+        reply_markup=_start_ping_keyboard(task_id),
+    )
+
+
+# ---------- job: endpoint ping ----------
+
+async def endpoint_ping(context: ContextTypes.DEFAULT_TYPE) -> None:
+    task_id: int = context.job.data
+    today = _today()
+
+    state = db.get_day_state(today)
+    if state["silenced"]:
+        return
+
+    task = db.get_task(task_id)
+    if task is None or task["status"] != "started":
+        return
+
+    db.log_event("endpoint_ping", task_id=task_id)
+    minutes = task["timer_minutes"]
+    await context.bot.send_message(
+        chat_id=config.CHAT_ID,
+        text=f"{minutes} min up on: {task['description']}. Done?",
+        reply_markup=_endpoint_keyboard(task_id),
+    )
+
+
+# ---------- job: evening ----------
+
+async def evening_prompt(context: ContextTypes.DEFAULT_TYPE) -> None:
+    today = _today()
+    state = db.get_day_state(today)
+    if state["silenced"] or state["evening_done"]:
+        return
+
+    db.mark_missed_tasks(today)
+    tasks = db.get_tasks_for_date(today)
+
+    if not tasks:
+        lines = ["No tasks were planned today."]
+    else:
+        lines = ["Today:"]
+        for t in tasks:
+            if t["status"] == "done":
+                lines.append(f"✓ {t['description']}")
+            elif t["status"] in ("missed", "started"):
+                lines.append(f"✗ {t['description']} (not started)")
+            elif t["status"] == "skipped":
+                lines.append(f"– {t['description']} (skipped)")
+            elif t["status"] == "stuck":
+                lines.append(f"– {t['description']} (stuck)")
+            else:
+                lines.append(f"– {t['description']} (unscheduled)")
+
+    lines.append("\nOne line — what got in the way?")
+    db.log_event("evening_prompt")
+    await context.bot.send_message(
+        chat_id=config.CHAT_ID,
+        text="\n".join(lines),
+    )
+
+
+# ---------- rehydrate (called from bot.py on startup) ----------
+
+def rehydrate_jobs(app) -> None:
+    """Re-register today's pending jobs from DB after a restart."""
+    today = _today()
+    now_utc = datetime.now(timezone.utc)
+    now_local = _local_now()
+
+    tasks = db.get_tasks_for_date(today)
+    for task in tasks:
+        task_id = task["id"]
+
+        if task["status"] == "planned" and task["planned_start"]:
+            h, m = task["planned_start"].split(":")
+            run_at_local = now_local.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
+            run_at_utc = run_at_local.astimezone(timezone.utc)
+            if run_at_utc > now_utc:
+                _schedule_start_ping(app, task_id, run_at_utc)
+                logger.info("Rehydrated start_ping for task %d at %s", task_id, task["planned_start"])
+
+        elif task["status"] == "started" and task["started_at"]:
+            started = datetime.fromisoformat(task["started_at"])
+            run_at_utc = started + timedelta(minutes=task["timer_minutes"])
+            _schedule_endpoint_ping(app, task_id, run_at_utc)
+            logger.info("Rehydrated endpoint_ping for task %d (fires at %s)", task_id, run_at_utc)

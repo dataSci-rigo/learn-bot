@@ -1,0 +1,137 @@
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime, timezone
+
+from config import DB_PATH
+
+
+@contextmanager
+def _conn():
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA journal_mode=WAL")
+    try:
+        yield con
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def init_db() -> None:
+    with _conn() as con:
+        con.executescript("""
+            CREATE TABLE IF NOT EXISTS tasks (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                date          TEXT    NOT NULL,
+                description   TEXT    NOT NULL,
+                planned_start TEXT,
+                timer_minutes INTEGER NOT NULL,
+                status        TEXT    NOT NULL DEFAULT 'planned',
+                created_at    TEXT    NOT NULL,
+                started_at    TEXT,
+                completed_at  TEXT,
+                outcome_note  TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS events (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts         TEXT    NOT NULL,
+                event_type TEXT    NOT NULL,
+                task_id    INTEGER,
+                payload    TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS day_state (
+                date         TEXT PRIMARY KEY,
+                silenced     INTEGER NOT NULL DEFAULT 0,
+                morning_done INTEGER NOT NULL DEFAULT 0,
+                evening_done INTEGER NOT NULL DEFAULT 0
+            );
+        """)
+
+
+# ---------- day_state helpers ----------
+
+def get_day_state(date: str) -> sqlite3.Row:
+    with _conn() as con:
+        row = con.execute("SELECT * FROM day_state WHERE date = ?", (date,)).fetchone()
+        if row is None:
+            con.execute(
+                "INSERT INTO day_state (date) VALUES (?)",
+                (date,),
+            )
+        row = con.execute("SELECT * FROM day_state WHERE date = ?", (date,)).fetchone()
+    return row
+
+
+def set_day_flag(date: str, column: str, value: int) -> None:
+    allowed = {"silenced", "morning_done", "evening_done"}
+    if column not in allowed:
+        raise ValueError(f"Unknown column: {column}")
+    with _conn() as con:
+        con.execute(f"""
+            INSERT INTO day_state (date, {column}) VALUES (?, ?)
+            ON CONFLICT(date) DO UPDATE SET {column} = excluded.{column}
+        """, (date, value))
+
+
+# ---------- tasks ----------
+
+def add_task(date: str, description: str, planned_start: str | None, timer_minutes: int) -> int:
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as con:
+        cur = con.execute(
+            """INSERT INTO tasks (date, description, planned_start, timer_minutes, status, created_at)
+               VALUES (?, ?, ?, ?, 'planned', ?)""",
+            (date, description, planned_start, timer_minutes, now),
+        )
+        return cur.lastrowid
+
+
+def get_tasks_for_date(date: str) -> list[sqlite3.Row]:
+    with _conn() as con:
+        return con.execute(
+            "SELECT * FROM tasks WHERE date = ? ORDER BY id",
+            (date,),
+        ).fetchall()
+
+
+def get_task(task_id: int) -> sqlite3.Row | None:
+    with _conn() as con:
+        return con.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+
+
+def update_task_status(task_id: int, status: str, **kwargs) -> None:
+    allowed_fields = {"started_at", "completed_at", "outcome_note"}
+    sets = ["status = ?"]
+    vals: list = [status]
+    for k, v in kwargs.items():
+        if k not in allowed_fields:
+            raise ValueError(f"Unknown field: {k}")
+        sets.append(f"{k} = ?")
+        vals.append(v)
+    vals.append(task_id)
+    with _conn() as con:
+        con.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", vals)
+
+
+def mark_missed_tasks(date: str) -> None:
+    with _conn() as con:
+        con.execute(
+            "UPDATE tasks SET status = 'missed' WHERE date = ? AND status IN ('planned', 'started')",
+            (date,),
+        )
+
+
+# ---------- events ----------
+
+def log_event(event_type: str, task_id: int | None = None, payload: str | None = None) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as con:
+        con.execute(
+            "INSERT INTO events (ts, event_type, task_id, payload) VALUES (?, ?, ?, ?)",
+            (now, event_type, task_id, payload),
+        )
