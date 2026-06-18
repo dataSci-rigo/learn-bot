@@ -21,7 +21,8 @@ MORNING_PING_TIME: str = os.getenv("MORNING_PING_TIME", "07:00")
 EVENING_PING_TIME: str = os.getenv("EVENING_PING_TIME", "21:00")
 DEFAULT_TIMER_MINUTES: int = int(os.getenv("DEFAULT_TIMER_MINUTES", "25"))
 SNOOZE_MINUTES: int = int(os.getenv("SNOOZE_MINUTES", "15"))
-DB_PATH: str = os.getenv("DB_PATH", "/opt/apps/adhd-bot/data/adhd.db")
+_SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH: str = os.getenv("DB_PATH", os.path.join(_SRC_DIR, "..", "data", "adhd.db"))
 
 
 def morning_time() -> tuple[int, int]:
