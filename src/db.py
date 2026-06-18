@@ -21,6 +21,8 @@ def _conn():
 
 
 def init_db() -> None:
+    import os
+    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     with _conn() as con:
         con.executescript("""
             CREATE TABLE IF NOT EXISTS tasks (
