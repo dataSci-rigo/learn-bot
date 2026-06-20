@@ -12,8 +12,8 @@ def _require(key: str) -> str:
     return val
 
 
-BOT_TOKEN: str = _require("TELEGRAM_BOT_TOKEN")
-CHAT_ID: int | None = int(os.getenv("TELEGRAM_CHAT_ID")) if os.getenv("TELEGRAM_CHAT_ID") else None
+BOT_TOKEN: str = _require("ADHD_BOT_ID")
+CHAT_ID: int | None = int(os.getenv("OWNER_CHAT_ID")) if os.getenv("OWNER_CHAT_ID") else None
 
 TZ = ZoneInfo(os.getenv("TIMEZONE", "America/Los_Angeles"))
 
