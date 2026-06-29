@@ -176,45 +176,56 @@ async def cmd_silence_today(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 # ---------- morning plan (free text) ----------
 
+def _lock_morning_plan_text(tasks: list) -> str:
+    lines = ["Locked in:"]
+    for i, t in enumerate(tasks, 1):
+        time_label = t["planned_start"] if t["planned_start"] else "unscheduled"
+        lines.append(f"{i}. {t['description']} — {time_label}")
+    if any(t["planned_start"] for t in tasks):
+        lines.append("I'll nudge you at each start time.")
+    else:
+        lines.append("No start times — you're on your own schedule today.")
+    return "\n".join(lines)
+
+
 async def handle_morning_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Parse the user's free-text morning plan into tasks."""
     today = _today()
     state = db.get_day_state(today)
     if state["morning_done"]:
-        return  # already done — fall through to generic handler
-
-    lines = [l.strip() for l in update.message.text.strip().splitlines() if l.strip()]
-    if not lines:
         return
 
-    if len(lines) > 3:
-        lines = lines[:3]
-        capped = True
-    else:
-        capped = False
+    existing = db.get_tasks_for_date(today)
+    slots_left = 3 - len(existing)
+    if slots_left <= 0:
+        # Auto-lock — shouldn't normally reach here
+        db.set_day_flag(today, "morning_done", 1)
+        return
+
+    raw_lines = [l.strip() for l in update.message.text.strip().splitlines() if l.strip()]
+    if not raw_lines:
+        return
+
+    capped = len(raw_lines) > slots_left
+    lines = raw_lines[:slots_left]
 
     now_local = _local_now()
-    locked_lines = ["Locked in:"]
-    task_count = 0
+    added = 0
 
     for line in lines:
         desc, planned_start = _parse_task_line(line)
         if not desc:
             continue
 
-        # Skip if the planned start has already passed today
         if planned_start:
             h, m = planned_start.split(":")
             start_local = now_local.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
             if start_local <= now_local:
-                planned_start = None  # treat as unscheduled
+                planned_start = None
 
         task_id = db.add_task(today, desc, planned_start, config.DEFAULT_TIMER_MINUTES)
         db.log_event("task_added", task_id=task_id, payload=desc)
-        task_count += 1
-
-        time_label = planned_start if planned_start else "unscheduled"
-        locked_lines.append(f"{task_count}. {desc} — {time_label}")
+        added += 1
 
         if planned_start:
             h, m = planned_start.split(":")
@@ -222,22 +233,52 @@ async def handle_morning_plan(update: Update, context: ContextTypes.DEFAULT_TYPE
             run_at_utc = run_at_local.astimezone(timezone.utc)
             _schedule_start_ping(context.application, task_id, run_at_utc)
 
-    if task_count == 0:
-        await update.message.reply_text("Couldn't parse that — send one task per line, e.g. `Call dentist @ 14:00`.", parse_mode="Markdown")
+    if added == 0:
+        await update.message.reply_text(
+            "Couldn't parse that — send one task per line, e.g. `Call dentist @ 14:00`.",
+            parse_mode="Markdown",
+        )
         return
 
-    db.set_day_flag(today, "morning_done", 1)
-
-    any_scheduled = any(t["planned_start"] for t in db.get_tasks_for_date(today))
-    if any_scheduled:
-        locked_lines.append("I'll nudge you at each start time.")
-    else:
-        locked_lines.append("No start times set — you're on your own schedule today.")
+    all_tasks = db.get_tasks_for_date(today)
+    total = len(all_tasks)
 
     if capped:
-        locked_lines.append("\nCapped at 3 — the rest can wait. Finishing beats listing.")
+        extra = "\nCapped at 3 — the rest can wait. Finishing beats listing."
+    else:
+        extra = ""
 
-    await update.message.reply_text("\n".join(locked_lines))
+    if total >= 3:
+        db.set_day_flag(today, "morning_done", 1)
+        await update.message.reply_text(_lock_morning_plan_text(all_tasks) + extra)
+    else:
+        remaining = 3 - total
+        task_word = "task" if remaining == 1 else "tasks"
+        list_lines = ["So far:"]
+        for i, t in enumerate(all_tasks, 1):
+            time_label = t["planned_start"] if t["planned_start"] else "unscheduled"
+            list_lines.append(f"{i}. {t['description']} — {time_label}")
+        list_lines.append(f"\nAdd up to {remaining} more {task_word}, or /done to lock in.{extra}")
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✓ Lock in", callback_data="lock_morning:0")]])
+        await update.message.reply_text("\n".join(list_lines), reply_markup=keyboard)
+
+
+# ---------- /done (lock morning plan) ----------
+
+async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        return
+    today = _today()
+    state = db.get_day_state(today)
+    if state["morning_done"]:
+        await update.message.reply_text("Morning plan already locked in.")
+        return
+    tasks = db.get_tasks_for_date(today)
+    if not tasks:
+        await update.message.reply_text("No tasks yet — send your list first.")
+        return
+    db.set_day_flag(today, "morning_done", 1)
+    await update.message.reply_text(_lock_morning_plan_text(tasks))
 
 
 # ---------- evening reply (free text) ----------
@@ -257,6 +298,58 @@ async def handle_evening_reply(update: Update, context: ContextTypes.DEFAULT_TYP
     db.log_event("evening_response", payload=text)
     db.set_day_flag(today, "evening_done", 1)
     await update.message.reply_text("Logged. See you tomorrow.")
+
+
+# ---------- /lesson + /lessons ----------
+
+async def cmd_lesson(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        return
+    context.user_data["lesson_stage"] = "went_well"
+    await update.message.reply_text("What went well today?")
+
+
+async def cmd_lessons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        return
+    lessons = db.get_lessons(limit=7)
+    if not lessons:
+        await update.message.reply_text("No lessons logged yet. Use /lesson to add one.")
+        return
+    parts = []
+    for lesson in lessons:
+        parts.append(f"*{lesson['date']}*")
+        parts.append(f"✓ {lesson['went_well']}")
+        parts.append(f"△ {lesson['to_improve']}")
+        if lesson["learning"]:
+            parts.append(f"💡 {lesson['learning']}")
+        parts.append("")
+    await update.message.reply_text("\n".join(parts).strip(), parse_mode="Markdown")
+
+
+async def handle_lesson_response(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    stage = context.user_data.get("lesson_stage")
+    text = update.message.text.strip()
+
+    if stage == "went_well":
+        context.user_data["lesson_went_well"] = text
+        context.user_data["lesson_stage"] = "to_improve"
+        await update.message.reply_text("What could go better?")
+
+    elif stage == "to_improve":
+        context.user_data["lesson_to_improve"] = text
+        context.user_data["lesson_stage"] = "learning"
+        await update.message.reply_text("What did you learn, if anything? (/skip to leave blank)")
+
+    elif stage == "learning":
+        today = _today()
+        went_well = context.user_data.pop("lesson_went_well", "")
+        to_improve = context.user_data.pop("lesson_to_improve", "")
+        context.user_data.pop("lesson_stage", None)
+        learning = None if text.lower() in ("skip", "/skip", "") else text
+        db.add_lesson(today, went_well, to_improve, learning)
+        db.log_event("lesson_logged", payload=today)
+        await update.message.reply_text("Lesson logged.")
 
 
 # ---------- outcome note after Done ----------
@@ -279,7 +372,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not _authorized(update):
         return
 
-    # Outcome note takes highest priority
+    # Lesson collection takes highest priority
+    if "lesson_stage" in context.user_data:
+        await handle_lesson_response(update, context)
+        return
+
+    # Outcome note
     if "awaiting_outcome_task_id" in context.user_data:
         await handle_outcome_note(update, context)
         return
@@ -306,6 +404,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.answer()
 
     action, task_id_str = query.data.split(":", 1)
+
+    # lock_morning doesn't need a task_id
+    if action == "lock_morning":
+        today = _today()
+        state = db.get_day_state(today)
+        if state["morning_done"]:
+            await query.edit_message_text("Already locked in.")
+            return
+        tasks = db.get_tasks_for_date(today)
+        if not tasks:
+            await query.edit_message_text("No tasks to lock in yet.")
+            return
+        db.set_day_flag(today, "morning_done", 1)
+        await query.edit_message_text(_lock_morning_plan_text(tasks))
+        return
+
     task_id = int(task_id_str)
     task = db.get_task(task_id)
     if task is None:

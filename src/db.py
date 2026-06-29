@@ -52,6 +52,15 @@ def init_db() -> None:
                 morning_done INTEGER NOT NULL DEFAULT 0,
                 evening_done INTEGER NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS lessons (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                date        TEXT    NOT NULL,
+                went_well   TEXT,
+                to_improve  TEXT,
+                learning    TEXT,
+                created_at  TEXT    NOT NULL
+            );
         """)
 
 
@@ -137,3 +146,23 @@ def log_event(event_type: str, task_id: int | None = None, payload: str | None =
             "INSERT INTO events (ts, event_type, task_id, payload) VALUES (?, ?, ?, ?)",
             (now, event_type, task_id, payload),
         )
+
+
+# ---------- lessons ----------
+
+def add_lesson(date: str, went_well: str, to_improve: str, learning: str | None) -> int:
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as con:
+        cur = con.execute(
+            "INSERT INTO lessons (date, went_well, to_improve, learning, created_at) VALUES (?, ?, ?, ?, ?)",
+            (date, went_well, to_improve, learning, now),
+        )
+        return cur.lastrowid
+
+
+def get_lessons(limit: int = 10) -> list[sqlite3.Row]:
+    with _conn() as con:
+        return con.execute(
+            "SELECT * FROM lessons ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()

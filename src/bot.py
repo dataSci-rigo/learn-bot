@@ -22,6 +22,9 @@ from handlers import (
     cmd_skip,
     cmd_snooze,
     cmd_silence_today,
+    cmd_done,
+    cmd_lesson,
+    cmd_lessons,
     handle_text,
     handle_callback,
 )
@@ -50,6 +53,9 @@ def main() -> None:
     app.add_handler(CommandHandler("skip", cmd_skip))
     app.add_handler(CommandHandler("snooze", cmd_snooze))
     app.add_handler(CommandHandler("silence_today", cmd_silence_today))
+    app.add_handler(CommandHandler("done", cmd_done))
+    app.add_handler(CommandHandler("lesson", cmd_lesson))
+    app.add_handler(CommandHandler("lessons", cmd_lessons))
 
     # --- free text ---
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
