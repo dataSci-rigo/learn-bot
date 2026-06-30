@@ -1,6 +1,7 @@
 """
 Telegram handlers: commands, morning/evening free text, inline callback queries.
 """
+import asyncio
 import logging
 import re
 from datetime import datetime, timezone, timedelta
@@ -8,6 +9,7 @@ from datetime import datetime, timezone, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
+import ai as ai_mod
 import config
 import db
 from jobs import (
@@ -314,13 +316,44 @@ async def cmd_todo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
     desc, planned_start = _parse_task_line(text)
-    task_id = db.add_task(_today(), desc, planned_start, timer_minutes=0)
-    time_str = f" @ {planned_start}" if planned_start else ""
+
+    # Drop times already in the past
+    now_local = _local_now()
+    if planned_start:
+        h, ms = planned_start.split(":")
+        start_local = now_local.replace(hour=int(h), minute=int(ms), second=0, microsecond=0)
+        if start_local <= now_local:
+            planned_start = None
+
+    task_id = db.add_task(_today(), desc, planned_start, config.DEFAULT_TIMER_MINUTES)
     db.log_event("command", task_id=task_id, payload="/todo")
-    await update.message.reply_text(
-        f"✅ Added: *{desc}*{time_str}",
-        parse_mode="Markdown",
-    )
+
+    # Schedule start ping if a future time was given
+    if planned_start:
+        h, ms = planned_start.split(":")
+        run_at_local = now_local.replace(hour=int(h), minute=int(ms), second=0, microsecond=0)
+        _schedule_start_ping(context.application, task_id, run_at_local.astimezone(timezone.utc))
+
+    time_str = f" @ {planned_start}" if planned_start else ""
+
+    # AI estimate (runs in thread so we don't block the event loop)
+    ai_estimate = await asyncio.to_thread(ai_mod.estimate_task_minutes, desc)
+
+    if ai_estimate is not None:
+        db.update_task_time_estimates(task_id, ai_estimate=ai_estimate)
+        prompt = (
+            f"✅ Added: *{desc}*{time_str}\n\n"
+            f"\U0001f916 AI estimate: ~{ai_estimate} min. How long do you think it'll take? "
+            f"(reply with minutes, or /skip)"
+        )
+    else:
+        prompt = (
+            f"✅ Added: *{desc}*{time_str}\n\n"
+            f"How long do you think this will take? (reply with minutes, or /skip)"
+        )
+
+    context.user_data["awaiting_estimate_task_id"] = task_id
+    await update.message.reply_text(prompt, parse_mode="Markdown")
 
 
 # ---------- /done (lock morning plan) ----------
@@ -412,6 +445,59 @@ async def handle_lesson_response(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("Lesson logged.")
 
 
+# ---------- time estimate collection ----------
+
+async def _handle_user_estimate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    task_id = context.user_data.pop("awaiting_estimate_task_id")
+    text = update.message.text.strip()
+    if text.lower() in ("skip", "/skip", ""):
+        await update.message.reply_text("No estimate saved — good luck!")
+        return
+    digits = re.sub(r"[^\d]", "", text)
+    if not digits:
+        context.user_data["awaiting_estimate_task_id"] = task_id
+        await update.message.reply_text("Enter a number of minutes (e.g. `30`), or /skip.", parse_mode="Markdown")
+        return
+    minutes = int(digits)
+    db.update_task_time_estimates(task_id, user_estimate=minutes)
+    task = db.get_task(task_id)
+    ai_est = task["ai_estimate_minutes"] if task else None
+    if ai_est:
+        diff = minutes - ai_est
+        sign = "+" if diff >= 0 else ""
+        await update.message.reply_text(
+            f"Got it — your estimate: {minutes} min (AI: {ai_est} min, diff {sign}{diff})."
+        )
+    else:
+        await update.message.reply_text(f"Got it — your estimate: {minutes} min.")
+
+
+async def _handle_actual_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    task_id = context.user_data.pop("awaiting_actual_time_task_id")
+    text = update.message.text.strip()
+    if text.lower() not in ("skip", "/skip", ""):
+        digits = re.sub(r"[^\d]", "", text)
+        if not digits:
+            context.user_data["awaiting_actual_time_task_id"] = task_id
+            await update.message.reply_text("Enter minutes (e.g. `45`), or /skip.", parse_mode="Markdown")
+            return
+        actual = int(digits)
+        db.update_task_time_estimates(task_id, actual=actual)
+        task = db.get_task(task_id)
+        parts = [f"Actual: {actual} min."]
+        if task:
+            if task["user_estimate_minutes"]:
+                d = actual - task["user_estimate_minutes"]
+                parts.append(f"You estimated {task['user_estimate_minutes']} min ({'+'if d>=0 else ''}{d}).")
+            if task["ai_estimate_minutes"]:
+                d = actual - task["ai_estimate_minutes"]
+                parts.append(f"AI estimated {task['ai_estimate_minutes']} min ({'+'if d>=0 else ''}{d}).")
+        await update.message.reply_text(" ".join(parts))
+
+    context.user_data["awaiting_outcome_task_id"] = task_id
+    await update.message.reply_text("Note for next time? (or /skip)")
+
+
 # ---------- outcome note after Done ----------
 
 async def handle_outcome_note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -435,6 +521,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # Lesson collection takes highest priority
     if "lesson_stage" in context.user_data:
         await handle_lesson_response(update, context)
+        return
+
+    if "awaiting_estimate_task_id" in context.user_data:
+        await _handle_user_estimate(update, context)
+        return
+
+    if "awaiting_actual_time_task_id" in context.user_data:
+        await _handle_actual_time(update, context)
         return
 
     # Outcome note
@@ -525,11 +619,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         db.update_task_status(task_id, "done", completed_at=now_utc.isoformat())
         db.log_event("task_done", task_id=task_id)
         await query.edit_message_text("One down.")
-        # Ask for optional outcome note
-        context.user_data["awaiting_outcome_task_id"] = task_id
+        context.user_data["awaiting_actual_time_task_id"] = task_id
         await context.bot.send_message(
             chat_id=config.CHAT_ID,
-            text="Note for next time? (or /skip)",
+            text="How long did that actually take? (minutes, or /skip)",
         )
 
     elif action == "end_more":

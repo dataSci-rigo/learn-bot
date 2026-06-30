@@ -26,16 +26,19 @@ def init_db() -> None:
     with _conn() as con:
         con.executescript("""
             CREATE TABLE IF NOT EXISTS tasks (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                date          TEXT    NOT NULL,
-                description   TEXT    NOT NULL,
-                planned_start TEXT,
-                timer_minutes INTEGER NOT NULL,
-                status        TEXT    NOT NULL DEFAULT 'planned',
-                created_at    TEXT    NOT NULL,
-                started_at    TEXT,
-                completed_at  TEXT,
-                outcome_note  TEXT
+                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                date                  TEXT    NOT NULL,
+                description           TEXT    NOT NULL,
+                planned_start         TEXT,
+                timer_minutes         INTEGER NOT NULL,
+                status                TEXT    NOT NULL DEFAULT 'planned',
+                created_at            TEXT    NOT NULL,
+                started_at            TEXT,
+                completed_at          TEXT,
+                outcome_note          TEXT,
+                ai_estimate_minutes   INTEGER,
+                user_estimate_minutes INTEGER,
+                actual_minutes        INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS events (
@@ -62,6 +65,15 @@ def init_db() -> None:
                 created_at  TEXT    NOT NULL
             );
         """)
+        # Migrate existing DBs that predate estimate columns
+        existing = {row[1] for row in con.execute("PRAGMA table_info(tasks)").fetchall()}
+        for col, typedef in [
+            ("ai_estimate_minutes",   "INTEGER"),
+            ("user_estimate_minutes", "INTEGER"),
+            ("actual_minutes",        "INTEGER"),
+        ]:
+            if col not in existing:
+                con.execute(f"ALTER TABLE tasks ADD COLUMN {col} {typedef}")
 
 
 # ---------- day_state helpers ----------
@@ -124,6 +136,27 @@ def update_task_status(task_id: int, status: str, **kwargs) -> None:
             raise ValueError(f"Unknown field: {k}")
         sets.append(f"{k} = ?")
         vals.append(v)
+    vals.append(task_id)
+    with _conn() as con:
+        con.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", vals)
+
+
+def update_task_time_estimates(
+    task_id: int,
+    *,
+    ai_estimate: int | None = None,
+    user_estimate: int | None = None,
+    actual: int | None = None,
+) -> None:
+    sets, vals = [], []
+    if ai_estimate is not None:
+        sets.append("ai_estimate_minutes = ?"); vals.append(ai_estimate)
+    if user_estimate is not None:
+        sets.append("user_estimate_minutes = ?"); vals.append(user_estimate)
+    if actual is not None:
+        sets.append("actual_minutes = ?"); vals.append(actual)
+    if not sets:
+        return
     vals.append(task_id)
     with _conn() as con:
         con.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", vals)
