@@ -6,6 +6,7 @@ import logging
 import sys
 from datetime import time as dtime
 
+from telegram import BotCommand
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -23,8 +24,10 @@ from handlers import (
     cmd_snooze,
     cmd_silence_today,
     cmd_done,
+    cmd_help,
     cmd_lesson,
     cmd_lessons,
+    cmd_todo,
     handle_text,
     handle_callback,
 )
@@ -38,12 +41,27 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+async def _post_init(app) -> None:
+    await app.bot.set_my_commands([
+        BotCommand("today",         "See today's task list"),
+        BotCommand("todo",          "Add a task: /todo Buy milk @ 14:00"),
+        BotCommand("skip",          "Skip today's morning plan"),
+        BotCommand("snooze",        "Snooze the current reminder"),
+        BotCommand("silence_today", "No more pings today"),
+        BotCommand("done",          "Lock in your morning plan"),
+        BotCommand("lesson",        "Log a lesson learned"),
+        BotCommand("lessons",       "View past lessons"),
+        BotCommand("help",          "Show all commands"),
+    ])
+
+
 def main() -> None:
     db.init_db()
 
     app = (
         Application.builder()
         .token(config.BOT_TOKEN)
+        .post_init(_post_init)
         .build()
     )
 
@@ -54,8 +72,10 @@ def main() -> None:
     app.add_handler(CommandHandler("snooze", cmd_snooze))
     app.add_handler(CommandHandler("silence_today", cmd_silence_today))
     app.add_handler(CommandHandler("done", cmd_done))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("lesson", cmd_lesson))
     app.add_handler(CommandHandler("lessons", cmd_lessons))
+    app.add_handler(CommandHandler("todo", cmd_todo))
 
     # --- free text ---
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))

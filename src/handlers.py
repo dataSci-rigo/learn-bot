@@ -74,6 +74,34 @@ def _parse_task_line(line: str) -> tuple[str, str | None]:
     return line, None
 
 
+_HELP_TEXT = """\
+🧠 *ADHD Bot*
+
+*Daily flow*
+Morning ping → send your task list, one per line:
+  `Call dentist @ 14:00`
+  `Finish report`
+  `Gym @ 18:00`
+Reply *done* when your plan is set.
+Evening ping → tell me how it went.
+
+*Add a task anytime*
+/todo Buy milk
+/todo Submit report @ 3pm
+
+*Commands*
+/today — see today's task list
+/todo <task> — add a task to today
+/skip — skip today's morning plan
+/snooze — snooze the current reminder
+/silence\_today — no more pings today
+/done — lock in your morning plan
+/lesson — log a lesson learned
+/lessons — view past lessons
+/help — show this message
+"""
+
+
 # ---------- /start ----------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -82,9 +110,18 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"Hey. Your chat ID is `{chat_id}`.\n\n"
         "Paste that into `TELEGRAM_CHAT_ID` in your `.env`, then restart the bot.\n\n"
-        "I'll ping you at your morning and evening times to run the daily loop.",
+        + _HELP_TEXT,
         parse_mode="Markdown",
     )
+
+
+# ---------- /help ----------
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        return
+    db.log_event("command", payload="/help")
+    await update.message.reply_text(_HELP_TEXT, parse_mode="Markdown")
 
 
 # ---------- /today ----------
@@ -261,6 +298,29 @@ async def handle_morning_plan(update: Update, context: ContextTypes.DEFAULT_TYPE
         list_lines.append(f"\nAdd up to {remaining} more {task_word}, or /done to lock in.{extra}")
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✓ Lock in", callback_data="lock_morning:0")]])
         await update.message.reply_text("\n".join(list_lines), reply_markup=keyboard)
+
+
+# ---------- /todo (add task to today) ----------
+
+async def cmd_todo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        return
+    text = " ".join(context.args).strip() if context.args else ""
+    if not text:
+        await update.message.reply_text(
+            "Usage: `/todo Call dentist @ 14:00`\n"
+            "The `@ HH:MM` time is optional.",
+            parse_mode="Markdown",
+        )
+        return
+    desc, planned_start = _parse_task_line(text)
+    task_id = db.add_task(_today(), desc, planned_start, timer_minutes=0)
+    time_str = f" @ {planned_start}" if planned_start else ""
+    db.log_event("command", task_id=task_id, payload="/todo")
+    await update.message.reply_text(
+        f"✅ Added: *{desc}*{time_str}",
+        parse_mode="Markdown",
+    )
 
 
 # ---------- /done (lock morning plan) ----------
