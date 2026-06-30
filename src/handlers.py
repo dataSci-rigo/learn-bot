@@ -447,11 +447,18 @@ async def handle_lesson_response(update: Update, context: ContextTypes.DEFAULT_T
 
 # ---------- time estimate collection ----------
 
+def _padded_timer(user_estimate: int) -> int:
+    """Add ~20% padding to user estimate, rounded to nearest 5 min, minimum +5."""
+    import math
+    padding = max(5, math.ceil(user_estimate * 0.20 / 5) * 5)
+    return user_estimate + padding
+
+
 async def _handle_user_estimate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     task_id = context.user_data.pop("awaiting_estimate_task_id")
     text = update.message.text.strip()
     if text.lower() in ("skip", "/skip", ""):
-        await update.message.reply_text("No estimate saved — good luck!")
+        await update.message.reply_text("No estimate saved — timer stays at default.")
         return
     digits = re.sub(r"[^\d]", "", text)
     if not digits:
@@ -459,17 +466,19 @@ async def _handle_user_estimate(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("Enter a number of minutes (e.g. `30`), or /skip.", parse_mode="Markdown")
         return
     minutes = int(digits)
+    timer = _padded_timer(minutes)
     db.update_task_time_estimates(task_id, user_estimate=minutes)
+    db.update_timer_minutes(task_id, timer)
     task = db.get_task(task_id)
     ai_est = task["ai_estimate_minutes"] if task else None
     if ai_est:
         diff = minutes - ai_est
         sign = "+" if diff >= 0 else ""
         await update.message.reply_text(
-            f"Got it — your estimate: {minutes} min (AI: {ai_est} min, diff {sign}{diff})."
+            f"Got it — your estimate: {minutes} min (AI: {ai_est} min, diff {sign}{diff}). Timer set to {timer} min."
         )
     else:
-        await update.message.reply_text(f"Got it — your estimate: {minutes} min.")
+        await update.message.reply_text(f"Got it — your estimate: {minutes} min. Timer set to {timer} min.")
 
 
 async def _handle_actual_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

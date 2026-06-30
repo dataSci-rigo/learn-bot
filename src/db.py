@@ -141,6 +141,11 @@ def update_task_status(task_id: int, status: str, **kwargs) -> None:
         con.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", vals)
 
 
+def update_timer_minutes(task_id: int, minutes: int) -> None:
+    with _conn() as con:
+        con.execute("UPDATE tasks SET timer_minutes = ? WHERE id = ?", (minutes, task_id))
+
+
 def update_task_time_estimates(
     task_id: int,
     *,
