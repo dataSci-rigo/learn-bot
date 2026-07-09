@@ -45,13 +45,17 @@ def _authorized(update: Update) -> bool:
 # ---------- time parsing ----------
 
 _TIME_PATTERNS = [
-    re.compile(r"@\s*(\d{1,2}):(\d{2})\s*$"),          # @ 10:30 or @10:30
-    re.compile(r"@\s*(\d{1,2})\s*$"),                    # @10
-    re.compile(r"\bat\s+(\d{1,2}):(\d{2})\s*$", re.I),  # at 10:30
-    re.compile(r"\bat\s+(\d{1,2})\s*$", re.I),          # at 10
-    re.compile(r"@\s*(\d{1,2})(am|pm)\s*$", re.I),      # @2pm
-    re.compile(r"\bat\s+(\d{1,2})(am|pm)\s*$", re.I),   # at 2pm
+    re.compile(r"@\s*(\d{1,2}):(\d{2})\s*(am|pm)\s*$", re.I),   # @ 10:30 AM/PM
+    re.compile(r"\bat\s+(\d{1,2}):(\d{2})\s*(am|pm)\s*$", re.I), # at 10:30 AM/PM
+    re.compile(r"@\s*(\d{1,2}):(\d{2})\s*$"),                     # @ 10:30 (24h)
+    re.compile(r"\bat\s+(\d{1,2}):(\d{2})\s*$", re.I),            # at 10:30 (24h)
+    re.compile(r"@\s*(\d{1,2})\s*(am|pm)\s*$", re.I),             # @ 2pm
+    re.compile(r"\bat\s+(\d{1,2})\s*(am|pm)\s*$", re.I),          # at 2pm
+    re.compile(r"@\s*(\d{1,2})\s*$"),                              # @ 10 (24h)
+    re.compile(r"\bat\s+(\d{1,2})\s*$", re.I),                     # at 10 (24h)
 ]
+
+_NUMERIC_PREFIX = re.compile(r"^\d+[\.\)]\s*")
 
 
 def _parse_task_line(line: str) -> tuple[str, str | None]:
@@ -61,19 +65,33 @@ def _parse_task_line(line: str) -> tuple[str, str | None]:
         m = pat.search(line)
         if m:
             desc = line[:m.start()].strip().rstrip("@").strip()
+            desc = _NUMERIC_PREFIX.sub("", desc)  # strip leading "1. " or "3) "
             groups = m.groups()
-            if len(groups) == 2 and groups[1] in ("am", "pm", "AM", "PM"):
-                hour = int(groups[0])
-                if groups[1].lower() == "pm" and hour != 12:
+            # groups is (hour, minute, ampm) or (hour, ampm) or (hour,)
+            if len(groups) == 3:
+                # HH:MM AM/PM
+                hour, minute, ampm = int(groups[0]), groups[1], groups[2].lower()
+                if ampm == "pm" and hour != 12:
                     hour += 12
-                if groups[1].lower() == "am" and hour == 12:
+                if ampm == "am" and hour == 12:
+                    hour = 0
+                return desc, f"{hour:02d}:{minute}"
+            elif len(groups) == 2 and groups[1].lower() in ("am", "pm"):
+                # H AM/PM
+                hour, ampm = int(groups[0]), groups[1].lower()
+                if ampm == "pm" and hour != 12:
+                    hour += 12
+                if ampm == "am" and hour == 12:
                     hour = 0
                 return desc, f"{hour:02d}:00"
             elif len(groups) == 2:
+                # HH:MM (24h)
                 return desc, f"{int(groups[0]):02d}:{groups[1]}"
             else:
+                # H (24h)
                 return desc, f"{int(groups[0]):02d}:00"
-    return line, None
+    desc = _NUMERIC_PREFIX.sub("", line)
+    return desc, None
 
 
 _HELP_TEXT = """\
@@ -334,10 +352,30 @@ async def cmd_todo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         run_at_local = now_local.replace(hour=int(h), minute=int(ms), second=0, microsecond=0)
         _schedule_start_ping(context.application, task_id, run_at_local.astimezone(timezone.utc))
 
-    time_str = f" @ {planned_start}" if planned_start else ""
+    today = _today()
+    state = db.get_day_state(today)
 
-    # AI estimate (runs in thread so we don't block the event loop)
+    # During morning planning phase: integrate into the plan instead of asking for estimate
+    if not state["morning_done"]:
+        all_tasks = db.get_tasks_for_date(today)
+        if len(all_tasks) >= 3:
+            db.set_day_flag(today, "morning_done", 1)
+            await update.message.reply_text(_lock_morning_plan_text(all_tasks))
+        else:
+            remaining = 3 - len(all_tasks)
+            task_word = "task" if remaining == 1 else "tasks"
+            lines = ["So far:"]
+            for i, t in enumerate(all_tasks, 1):
+                time_label = t["planned_start"] if t["planned_start"] else "unscheduled"
+                lines.append(f"{i}. {t['description']} — {time_label}")
+            lines.append(f"\nAdd up to {remaining} more {task_word}, or /done to lock in.")
+            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✓ Lock in", callback_data="lock_morning:0")]])
+            await update.message.reply_text("\n".join(lines), reply_markup=keyboard)
+        return
+
+    # Mid-day: ask for time estimate so we can set a useful timer
     ai_estimate = await asyncio.to_thread(ai_mod.estimate_task_minutes, desc)
+    time_str = f" @ {planned_start}" if planned_start else ""
 
     if ai_estimate is not None:
         db.update_task_time_estimates(task_id, ai_estimate=ai_estimate)
@@ -454,18 +492,35 @@ def _padded_timer(user_estimate: int) -> int:
     return user_estimate + padding
 
 
+def _parse_estimate_minutes(text: str) -> int | None:
+    """Parse user's time estimate. Handles '30', '1:30' (1h30m), '1h', '1.5h'."""
+    text = text.strip().lower()
+    # H:MM format → hours * 60 + minutes
+    m = re.fullmatch(r"(\d+):(\d{2})", text)
+    if m:
+        return int(m.group(1)) * 60 + int(m.group(2))
+    # Nh or NhMm
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*h(?:r|ours?)?(?:\s*(\d+)\s*m?)?", text)
+    if m:
+        hours = float(m.group(1))
+        mins = int(m.group(2)) if m.group(2) else 0
+        return round(hours * 60) + mins
+    # Plain number (minutes)
+    digits = re.sub(r"[^\d]", "", text)
+    return int(digits) if digits else None
+
+
 async def _handle_user_estimate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     task_id = context.user_data.pop("awaiting_estimate_task_id")
     text = update.message.text.strip()
     if text.lower() in ("skip", "/skip", ""):
         await update.message.reply_text("No estimate saved — timer stays at default.")
         return
-    digits = re.sub(r"[^\d]", "", text)
-    if not digits:
+    minutes = _parse_estimate_minutes(text)
+    if minutes is None:
         context.user_data["awaiting_estimate_task_id"] = task_id
-        await update.message.reply_text("Enter a number of minutes (e.g. `30`), or /skip.", parse_mode="Markdown")
+        await update.message.reply_text("Enter a number of minutes (e.g. `30`, `1:30`, `1h`), or /skip.", parse_mode="Markdown")
         return
-    minutes = int(digits)
     timer = _padded_timer(minutes)
     db.update_task_time_estimates(task_id, user_estimate=minutes)
     db.update_timer_minutes(task_id, timer)
@@ -552,9 +607,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await handle_morning_plan(update, context)
         return
 
-    if state["morning_done"] and not state["evening_done"] and _local_now().hour >= 18:
+    if not state["evening_done"] and _local_now().hour >= 18:
         await handle_evening_reply(update, context)
         return
+
+    # Plan is locked, not yet evening — give feedback instead of silently ignoring
+    await update.message.reply_text(
+        "Plan is locked in. Use /today to see your tasks, or /todo to add one."
+    )
 
 
 # ---------- inline callback queries ----------
