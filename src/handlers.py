@@ -1,6 +1,7 @@
 """
 Telegram handlers: commands, morning/evening free text, inline callback queries.
 """
+from __future__ import annotations
 import asyncio
 import logging
 import re
@@ -94,6 +95,12 @@ def _parse_task_line(line: str) -> tuple[str, str | None]:
     return desc, None
 
 
+def _parse_time_only(text: str) -> str | None:
+    """Parse a bare time string like '8:30 PM' or '@9pm'. Returns 'HH:MM' or None."""
+    _, start = _parse_task_line("x " + text)
+    return start
+
+
 _HELP_TEXT = """\
 🧠 *ADHD Bot*
 
@@ -178,10 +185,91 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
+    # If bot is mid-conversation, /skip means "skip this prompt", not "skip the day"
+    if "awaiting_actual_time_task_id" in context.user_data:
+        await _handle_actual_time(update, context)
+        return
+    if "awaiting_outcome_task_id" in context.user_data:
+        await handle_outcome_note(update, context)
+        return
+    if "awaiting_estimate_task_id" in context.user_data:
+        await _handle_user_estimate(update, context)
+        return
     today = _today()
     db.set_day_flag(today, "morning_done", 1)
     db.log_event("silence_today", payload="/skip")
     await update.message.reply_text("Got it — taking the day off. No tasks logged.")
+
+
+# ---------- /at — reschedule task by number ----------
+
+async def cmd_at(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        return
+    args_text = " ".join(context.args).strip() if context.args else ""
+    parts = args_text.split(None, 1)
+    if len(parts) < 2:
+        await update.message.reply_text(
+            "Usage: `/at 1 8:30 PM` — sets the time on task #1 and schedules its reminder.",
+            parse_mode="Markdown",
+        )
+        return
+    try:
+        task_num = int(parts[0])
+    except ValueError:
+        await update.message.reply_text("First argument must be a task number. `/at 1 8:30 PM`", parse_mode="Markdown")
+        return
+
+    planned_start = _parse_time_only(parts[1])
+    if not planned_start:
+        await update.message.reply_text(f"Couldn't parse time `{parts[1]}`. Try `8:30 PM` or `20:30`.", parse_mode="Markdown")
+        return
+
+    today = _today()
+    tasks = db.get_tasks_for_date(today)
+    if task_num < 1 or task_num > len(tasks):
+        await update.message.reply_text(f"No task #{task_num}. You have {len(tasks)} task(s) today.")
+        return
+
+    task = tasks[task_num - 1]
+    task_id = task["id"]
+    if task["status"] not in ("planned",):
+        await update.message.reply_text(f"Task #{task_num} is already {task['status']}.")
+        return
+
+    with db._conn() as con:
+        con.execute("UPDATE tasks SET planned_start = ? WHERE id = ?", (planned_start, task_id))
+
+    now_local = _local_now()
+    h, m = planned_start.split(":")
+    run_at_local = now_local.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
+    if run_at_local <= now_local:
+        await update.message.reply_text(f"#{task_num} {task['description']} — {planned_start} is in the past, no reminder set.")
+        return
+
+    run_at_utc = run_at_local.astimezone(timezone.utc)
+    _schedule_start_ping(context.application, task_id, run_at_utc)
+    db.log_event("rescheduled", task_id=task_id, payload=planned_start)
+    await update.message.reply_text(f"#{task_num} *{task['description']}* → {planned_start}. Reminder set.", parse_mode="Markdown")
+
+
+# ---------- /begin — start a planned task now ----------
+
+async def cmd_begin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        return
+    today = _today()
+    tasks = [t for t in db.get_tasks_for_date(today) if t["status"] == "planned"]
+    if not tasks:
+        await update.message.reply_text("No planned tasks left. Use /todo to add one.")
+        return
+    buttons = []
+    for t in tasks:
+        label = t["description"]
+        if t["planned_start"]:
+            label += f" @ {t['planned_start']}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"begin_task:{t['id']}")])
+    await update.message.reply_text("Which task are you starting now?", reply_markup=InlineKeyboardMarkup(buttons))
 
 
 # ---------- /snooze ----------
@@ -245,6 +333,53 @@ def _lock_morning_plan_text(tasks: list) -> str:
     return "\n".join(lines)
 
 
+async def _finalize_morning_plan(update_or_query, context: ContextTypes.DEFAULT_TYPE, capped: bool = False) -> None:
+    """Show 'so far' or 'locked in' after adding tasks. Works from message or callback."""
+    today = _today()
+    all_tasks = db.get_tasks_for_date(today)
+    total = len(all_tasks)
+    extra = "\nCapped at 3 — the rest can wait. Finishing beats listing." if capped else ""
+
+    send = (
+        update_or_query.edit_message_text
+        if hasattr(update_or_query, "edit_message_text")
+        else update_or_query.message.reply_text
+    )
+
+    if total >= 3:
+        db.set_day_flag(today, "morning_done", 1)
+        await send(_lock_morning_plan_text(all_tasks) + extra)
+    else:
+        remaining = 3 - total
+        task_word = "task" if remaining == 1 else "tasks"
+        list_lines = ["So far:"]
+        for i, t in enumerate(all_tasks, 1):
+            time_label = t["planned_start"] if t["planned_start"] else "unscheduled"
+            list_lines.append(f"{i}. {t['description']} — {time_label}")
+        list_lines.append(f"\nAdd up to {remaining} more {task_word}, or /done to lock in.{extra}")
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✓ Lock in", callback_data="lock_morning:0")]])
+        await send("\n".join(list_lines), reply_markup=keyboard)
+
+
+async def _prompt_confirm_unscheduled(update_or_query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show confirm prompt for the next queued unscheduled task."""
+    queue = context.user_data.get("confirm_queue", [])
+    if not queue:
+        await _finalize_morning_plan(update_or_query, context)
+        return
+    desc = queue[0]
+    send = (
+        update_or_query.edit_message_text
+        if hasattr(update_or_query, "edit_message_text")
+        else update_or_query.message.reply_text
+    )
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Add (no time)", callback_data="confirm_add:1"),
+        InlineKeyboardButton("Skip", callback_data="confirm_add:0"),
+    ]])
+    await send(f"'{desc}' has no time set. Add it anyway?\nUse /at later to set a time, or /begin to start it.", reply_markup=keyboard)
+
+
 async def handle_morning_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Parse the user's free-text morning plan into tasks."""
     today = _today()
@@ -268,6 +403,7 @@ async def handle_morning_plan(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     now_local = _local_now()
     added = 0
+    unscheduled_queue: list[str] = []
 
     for line in lines:
         desc, planned_start = _parse_task_line(line)
@@ -280,44 +416,33 @@ async def handle_morning_plan(update: Update, context: ContextTypes.DEFAULT_TYPE
             if start_local <= now_local:
                 planned_start = None
 
+        if not planned_start:
+            unscheduled_queue.append(desc)
+            continue
+
         task_id = db.add_task(today, desc, planned_start, config.DEFAULT_TIMER_MINUTES)
         db.log_event("task_added", task_id=task_id, payload=desc)
         added += 1
 
-        if planned_start:
-            h, m = planned_start.split(":")
-            run_at_local = now_local.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
-            run_at_utc = run_at_local.astimezone(timezone.utc)
-            _schedule_start_ping(context.application, task_id, run_at_utc)
+        h, m = planned_start.split(":")
+        run_at_local = now_local.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
+        run_at_utc = run_at_local.astimezone(timezone.utc)
+        _schedule_start_ping(context.application, task_id, run_at_utc)
 
-    if added == 0:
+    if added == 0 and not unscheduled_queue:
         await update.message.reply_text(
             "Couldn't parse that — send one task per line, e.g. `Call dentist @ 14:00`.",
             parse_mode="Markdown",
         )
         return
 
-    all_tasks = db.get_tasks_for_date(today)
-    total = len(all_tasks)
+    context.user_data["confirm_queue"] = (context.user_data.get("confirm_queue") or []) + unscheduled_queue
+    context.user_data["confirm_capped"] = capped
 
-    if capped:
-        extra = "\nCapped at 3 — the rest can wait. Finishing beats listing."
+    if unscheduled_queue:
+        await _prompt_confirm_unscheduled(update, context)
     else:
-        extra = ""
-
-    if total >= 3:
-        db.set_day_flag(today, "morning_done", 1)
-        await update.message.reply_text(_lock_morning_plan_text(all_tasks) + extra)
-    else:
-        remaining = 3 - total
-        task_word = "task" if remaining == 1 else "tasks"
-        list_lines = ["So far:"]
-        for i, t in enumerate(all_tasks, 1):
-            time_label = t["planned_start"] if t["planned_start"] else "unscheduled"
-            list_lines.append(f"{i}. {t['description']} — {time_label}")
-        list_lines.append(f"\nAdd up to {remaining} more {task_word}, or /done to lock in.{extra}")
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✓ Lock in", callback_data="lock_morning:0")]])
-        await update.message.reply_text("\n".join(list_lines), reply_markup=keyboard)
+        await _finalize_morning_plan(update, context, capped=capped)
 
 
 # ---------- /todo (add task to today) ----------
@@ -628,7 +753,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     action, task_id_str = query.data.split(":", 1)
 
-    # lock_morning doesn't need a task_id
+    # Actions that don't use a DB task_id
     if action == "lock_morning":
         today = _today()
         state = db.get_day_state(today)
@@ -641,6 +766,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         db.set_day_flag(today, "morning_done", 1)
         await query.edit_message_text(_lock_morning_plan_text(tasks))
+        return
+
+    if action == "confirm_add":
+        choice = int(task_id_str)
+        queue: list[str] = context.user_data.get("confirm_queue", [])
+        if not queue:
+            await query.answer("Nothing to confirm.")
+            return
+        desc = queue.pop(0)
+        context.user_data["confirm_queue"] = queue
+        capped = context.user_data.get("confirm_capped", False)
+        if choice == 1:
+            today = _today()
+            new_id = db.add_task(today, desc, None, config.DEFAULT_TIMER_MINUTES)
+            db.log_event("task_added", task_id=new_id, payload=desc)
+        if queue:
+            await _prompt_confirm_unscheduled(query, context)
+        else:
+            await _finalize_morning_plan(query, context, capped=capped)
         return
 
     task_id = int(task_id_str)
@@ -711,4 +855,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         db.log_event("task_stuck", task_id=task_id)
         await query.edit_message_text(
             "Parked. We'll dig into what 'stuck' means in the weekly review. Move on?"
+        )
+
+    elif action == "begin_task":
+        if task["status"] != "planned":
+            await query.edit_message_text(f"Task is already {task['status']}.")
+            return
+        minutes = task["timer_minutes"]
+        await query.edit_message_text(
+            f"Start: {task['description']}. Begin a {minutes}-min timer?",
+            reply_markup=_start_ping_keyboard(task_id),
         )

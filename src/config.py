@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv

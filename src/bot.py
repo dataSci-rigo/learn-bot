@@ -28,6 +28,8 @@ from handlers import (
     cmd_lesson,
     cmd_lessons,
     cmd_todo,
+    cmd_at,
+    cmd_begin,
     handle_text,
     handle_callback,
 )
@@ -45,6 +47,8 @@ async def _post_init(app) -> None:
     await app.bot.set_my_commands([
         BotCommand("today",         "See today's task list"),
         BotCommand("todo",          "Add a task: /todo Buy milk @ 14:00"),
+        BotCommand("begin",         "Start a planned task now"),
+        BotCommand("at",            "Set time on task: /at 1 8:30 PM"),
         BotCommand("skip",          "Skip today's morning plan"),
         BotCommand("snooze",        "Snooze the current reminder"),
         BotCommand("silence_today", "No more pings today"),
@@ -76,6 +80,8 @@ def main() -> None:
     app.add_handler(CommandHandler("lesson", cmd_lesson))
     app.add_handler(CommandHandler("lessons", cmd_lessons))
     app.add_handler(CommandHandler("todo", cmd_todo))
+    app.add_handler(CommandHandler("at", cmd_at))
+    app.add_handler(CommandHandler("begin", cmd_begin))
 
     # --- free text ---
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
