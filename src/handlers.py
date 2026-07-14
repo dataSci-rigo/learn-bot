@@ -516,7 +516,8 @@ async def cmd_todo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
     context.user_data["awaiting_estimate_task_id"] = task_id
-    await update.message.reply_text(prompt, parse_mode="Markdown")
+    msg = await update.message.reply_text(prompt, parse_mode="Markdown")
+    context.user_data["awaiting_estimate_msg_id"] = msg.message_id
 
 
 # ---------- /done (lock morning plan) ----------
@@ -684,7 +685,8 @@ async def _handle_actual_time(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(" ".join(parts))
 
     context.user_data["awaiting_outcome_task_id"] = task_id
-    await update.message.reply_text("Note for next time? (or /skip)")
+    msg = await update.message.reply_text("Note for next time? (or /skip)")
+    context.user_data["awaiting_outcome_msg_id"] = msg.message_id
 
 
 # ---------- outcome note after Done ----------
@@ -712,18 +714,29 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await handle_lesson_response(update, context)
         return
 
+    reply_to_id = (update.message.reply_to_message.message_id
+                   if update.message.reply_to_message else None)
+
+    def _reply_targets(key: str) -> bool:
+        """True if this message should be routed to the awaiting state keyed by `key`."""
+        stored = context.user_data.get(key)
+        # Direct message (no reply) or replied to our specific prompt → consume the state
+        return reply_to_id is None or stored is None or reply_to_id == stored
+
     if "awaiting_estimate_task_id" in context.user_data:
-        await _handle_user_estimate(update, context)
-        return
+        if _reply_targets("awaiting_estimate_msg_id"):
+            await _handle_user_estimate(update, context)
+            return
 
     if "awaiting_actual_time_task_id" in context.user_data:
-        await _handle_actual_time(update, context)
-        return
+        if _reply_targets("awaiting_actual_time_msg_id"):
+            await _handle_actual_time(update, context)
+            return
 
-    # Outcome note
     if "awaiting_outcome_task_id" in context.user_data:
-        await handle_outcome_note(update, context)
-        return
+        if _reply_targets("awaiting_outcome_msg_id"):
+            await handle_outcome_note(update, context)
+            return
 
     today = _today()
     state = db.get_day_state(today)
@@ -833,10 +846,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         db.log_event("task_done", task_id=task_id)
         await query.edit_message_text("One down.")
         context.user_data["awaiting_actual_time_task_id"] = task_id
-        await context.bot.send_message(
+        msg = await context.bot.send_message(
             chat_id=config.CHAT_ID,
             text="How long did that actually take? (minutes, or /skip)",
         )
+        context.user_data["awaiting_actual_time_msg_id"] = msg.message_id
 
     elif action == "end_more":
         if task["status"] != "started":
