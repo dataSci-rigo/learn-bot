@@ -171,6 +171,17 @@ def rehydrate_jobs(app) -> None:
     now_utc = datetime.now(timezone.utc)
     now_local = _local_now()
 
+    # If the bot restarted after the morning ping time, run_daily won't fire
+    # until tomorrow. Send the morning prompt now if we missed it today.
+    state = db.get_day_state(today)
+    if not state["morning_done"] and not state["silenced"]:
+        mh, mm = config.morning_time()
+        morning_dt = now_local.replace(hour=mh, minute=mm, second=0, microsecond=0)
+        noon_dt    = now_local.replace(hour=12, minute=0, second=0, microsecond=0)
+        if morning_dt <= now_local <= noon_dt:
+            logger.info("Morning prompt missed (bot restarted after %02d:%02d) — firing now", mh, mm)
+            app.job_queue.run_once(morning_prompt, when=5, name="morning_rehydrate")
+
     tasks = db.get_tasks_for_date(today)
     for task in tasks:
         task_id = task["id"]
