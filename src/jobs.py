@@ -163,6 +163,52 @@ async def evening_prompt(context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+# ---------- daily scheduling (self-rescheduling run_once) ----------
+#
+# run_daily(tzinfo=ZoneInfo(...)) is unreliable in APScheduler 3.x — it may
+# fire at 7 AM UTC instead of 7 AM local time. These helpers compute the exact
+# next UTC instant and use run_once, then reschedule themselves after each fire.
+
+def _next_occurrence_utc(hour: int, minute: int) -> datetime:
+    """Next future UTC datetime for the given local clock time (today or tomorrow)."""
+    now_local = _local_now()
+    target = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now_local:
+        target += timedelta(days=1)
+    return target.astimezone(timezone.utc)
+
+
+async def _morning_wrapper(context: ContextTypes.DEFAULT_TYPE) -> None:
+    await morning_prompt(context)
+    mh, mm = config.morning_time()
+    _run_once_at(context.application, _morning_wrapper, _next_occurrence_utc(mh, mm), "morning_scheduled")
+
+
+async def _evening_wrapper(context: ContextTypes.DEFAULT_TYPE) -> None:
+    await evening_prompt(context)
+    eh, em = config.evening_time()
+    _run_once_at(context.application, _evening_wrapper, _next_occurrence_utc(eh, em), "evening_scheduled")
+
+
+def _run_once_at(app, callback, run_at_utc: datetime, name: str) -> None:
+    delay = max((run_at_utc - datetime.now(timezone.utc)).total_seconds(), 0)
+    app.job_queue.run_once(callback, when=delay, name=name)
+
+
+def schedule_morning(app) -> None:
+    mh, mm = config.morning_time()
+    run_at = _next_occurrence_utc(mh, mm)
+    logger.info("Morning prompt scheduled for %s UTC", run_at.strftime("%Y-%m-%d %H:%M"))
+    _run_once_at(app, _morning_wrapper, run_at, "morning_scheduled")
+
+
+def schedule_evening(app) -> None:
+    eh, em = config.evening_time()
+    run_at = _next_occurrence_utc(eh, em)
+    logger.info("Evening prompt scheduled for %s UTC", run_at.strftime("%Y-%m-%d %H:%M"))
+    _run_once_at(app, _evening_wrapper, run_at, "evening_scheduled")
+
+
 # ---------- rehydrate (called from bot.py on startup) ----------
 
 def rehydrate_jobs(app) -> None:

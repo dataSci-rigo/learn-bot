@@ -4,7 +4,6 @@ rehydrates today's jobs from DB, then starts long-polling.
 """
 import logging
 import sys
-from datetime import time as dtime
 
 from telegram import BotCommand
 from telegram.ext import (
@@ -33,7 +32,7 @@ from handlers import (
     handle_text,
     handle_callback,
 )
-from jobs import morning_prompt, evening_prompt, rehydrate_jobs
+from jobs import schedule_morning, schedule_evening, rehydrate_jobs
 
 logging.basicConfig(
     level=logging.INFO,
@@ -89,20 +88,14 @@ def main() -> None:
     # --- inline keyboard callbacks ---
     app.add_handler(CallbackQueryHandler(handle_callback))
 
-    # --- daily recurring jobs ---
-    mh, mm = config.morning_time()
-    eh, em = config.evening_time()
+    # --- error handler so job failures appear in logs ---
+    async def _error_handler(update, context) -> None:
+        logger.error("Unhandled exception", exc_info=context.error)
+    app.add_error_handler(_error_handler)
 
-    app.job_queue.run_daily(
-        morning_prompt,
-        time=dtime(hour=mh, minute=mm, tzinfo=config.TZ),
-        name="morning_daily",
-    )
-    app.job_queue.run_daily(
-        evening_prompt,
-        time=dtime(hour=eh, minute=em, tzinfo=config.TZ),
-        name="evening_daily",
-    )
+    # --- daily prompts (self-rescheduling run_once, avoids APScheduler TZ issues) ---
+    schedule_morning(app)
+    schedule_evening(app)
 
     # --- rehydrate today's one-shot jobs after a restart ---
     rehydrate_jobs(app)
