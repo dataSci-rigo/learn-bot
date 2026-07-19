@@ -520,15 +520,41 @@ async def cmd_todo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["awaiting_estimate_msg_id"] = msg.message_id
 
 
-# ---------- /done (lock morning plan) ----------
+def _cancel_job(context: ContextTypes.DEFAULT_TYPE, name: str) -> None:
+    for job in context.application.job_queue.jobs():
+        if job.name == name:
+            job.schedule_removal()
+
+
+async def _complete_started_task(update: Update, context: ContextTypes.DEFAULT_TYPE, task: dict) -> None:
+    """Mark a 'started' task done immediately (early finish), same as the
+    endpoint-ping 'Done' button, then ask for actual time spent."""
+    task_id = task["id"]
+    now_utc = _utc_now()
+    db.update_task_status(task_id, "done", completed_at=now_utc.isoformat())
+    db.log_event("task_done", task_id=task_id)
+    _cancel_job(context, f"endpoint_ping_{task_id}")
+    await update.message.reply_text(f"One down: {task['description']}.")
+    context.user_data["awaiting_actual_time_task_id"] = task_id
+    msg = await update.message.reply_text("How long did that actually take? (minutes, or /skip)")
+    context.user_data["awaiting_actual_time_msg_id"] = msg.message_id
+
+
+# ---------- /done (finish a running task, or lock morning plan) ----------
 
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
     today = _today()
+
+    started = [t for t in db.get_tasks_for_date(today) if t["status"] == "started"]
+    if started:
+        await _complete_started_task(update, context, started[0])
+        return
+
     state = db.get_day_state(today)
     if state["morning_done"]:
-        await update.message.reply_text("Morning plan already locked in.")
+        await update.message.reply_text("Morning plan already locked in. No task currently running.")
         return
     tasks = db.get_tasks_for_date(today)
     if not tasks:
@@ -544,7 +570,7 @@ async def handle_evening_reply(update: Update, context: ContextTypes.DEFAULT_TYP
     """Capture the one-line evening reflection."""
     today = _today()
     state = db.get_day_state(today)
-    if not state["morning_done"] or state["evening_done"]:
+    if not state["evening_prompted"] or state["evening_done"]:
         return  # not in evening state
 
     # Only accept after 18:00 local to avoid swallowing daytime messages
@@ -741,12 +767,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     today = _today()
     state = db.get_day_state(today)
 
-    if not state["morning_done"]:
-        await handle_morning_plan(update, context)
+    # Evening reply takes priority once the evening prompt has actually gone
+    # out — otherwise, on a day where morning_done never got set (missed
+    # prompt, /skip never sent, etc.), the reflection reply gets misread as
+    # a new morning task line.
+    if state["evening_prompted"] and not state["evening_done"] and _local_now().hour >= 18:
+        await handle_evening_reply(update, context)
         return
 
-    if not state["evening_done"] and _local_now().hour >= 18:
-        await handle_evening_reply(update, context)
+    if not state["morning_done"]:
+        await handle_morning_plan(update, context)
         return
 
     # Plan is locked, not yet evening — give feedback instead of silently ignoring

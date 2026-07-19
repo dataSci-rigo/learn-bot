@@ -157,6 +157,7 @@ async def evening_prompt(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     lines.append("\nOne line — what got in the way?")
     db.log_event("evening_prompt")
+    db.set_day_flag(today, "evening_prompted", 1)
     await context.bot.send_message(
         chat_id=config.CHAT_ID,
         text="\n".join(lines),
@@ -179,15 +180,21 @@ def _next_occurrence_utc(hour: int, minute: int) -> datetime:
 
 
 async def _morning_wrapper(context: ContextTypes.DEFAULT_TYPE) -> None:
-    await morning_prompt(context)
-    mh, mm = config.morning_time()
-    _run_once_at(context.application, _morning_wrapper, _next_occurrence_utc(mh, mm), "morning_scheduled")
+    try:
+        await morning_prompt(context)
+    finally:
+        # Always reschedule tomorrow, even if today's send/DB call failed —
+        # otherwise one failure silently kills every future morning prompt.
+        mh, mm = config.morning_time()
+        _run_once_at(context.application, _morning_wrapper, _next_occurrence_utc(mh, mm), "morning_scheduled")
 
 
 async def _evening_wrapper(context: ContextTypes.DEFAULT_TYPE) -> None:
-    await evening_prompt(context)
-    eh, em = config.evening_time()
-    _run_once_at(context.application, _evening_wrapper, _next_occurrence_utc(eh, em), "evening_scheduled")
+    try:
+        await evening_prompt(context)
+    finally:
+        eh, em = config.evening_time()
+        _run_once_at(context.application, _evening_wrapper, _next_occurrence_utc(eh, em), "evening_scheduled")
 
 
 def _run_once_at(app, callback, run_at_utc: datetime, name: str) -> None:

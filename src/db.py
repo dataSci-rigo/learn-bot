@@ -52,10 +52,11 @@ def init_db() -> None:
             );
 
             CREATE TABLE IF NOT EXISTS day_state (
-                date         TEXT PRIMARY KEY,
-                silenced     INTEGER NOT NULL DEFAULT 0,
-                morning_done INTEGER NOT NULL DEFAULT 0,
-                evening_done INTEGER NOT NULL DEFAULT 0
+                date             TEXT PRIMARY KEY,
+                silenced         INTEGER NOT NULL DEFAULT 0,
+                morning_done     INTEGER NOT NULL DEFAULT 0,
+                evening_done     INTEGER NOT NULL DEFAULT 0,
+                evening_prompted INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS lessons (
@@ -77,6 +78,11 @@ def init_db() -> None:
             if col not in existing:
                 con.execute(f"ALTER TABLE tasks ADD COLUMN {col} {typedef}")
 
+        # Migrate existing DBs that predate evening_prompted
+        existing_day_state = {row[1] for row in con.execute("PRAGMA table_info(day_state)").fetchall()}
+        if "evening_prompted" not in existing_day_state:
+            con.execute("ALTER TABLE day_state ADD COLUMN evening_prompted INTEGER NOT NULL DEFAULT 0")
+
 
 # ---------- day_state helpers ----------
 
@@ -93,7 +99,7 @@ def get_day_state(date: str) -> sqlite3.Row:
 
 
 def set_day_flag(date: str, column: str, value: int) -> None:
-    allowed = {"silenced", "morning_done", "evening_done"}
+    allowed = {"silenced", "morning_done", "evening_done", "evening_prompted"}
     if column not in allowed:
         raise ValueError(f"Unknown column: {column}")
     with _conn() as con:
