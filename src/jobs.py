@@ -218,6 +218,11 @@ def schedule_evening(app) -> None:
 
 # ---------- rehydrate (called from bot.py on startup) ----------
 
+async def _send_rehydrate_alert(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if config.CHAT_ID:
+        await context.bot.send_message(chat_id=config.CHAT_ID, text=context.job.data)
+
+
 def rehydrate_jobs(app) -> None:
     """Re-register today's pending jobs from DB after a restart."""
     today = _today()
@@ -235,6 +240,9 @@ def rehydrate_jobs(app) -> None:
             logger.info("Morning prompt missed (bot restarted after %02d:%02d) — firing now", mh, mm)
             app.job_queue.run_once(morning_prompt, when=5, name="morning_rehydrate")
 
+    rehydrated = 0
+    missed: list[str] = []
+
     tasks = db.get_tasks_for_date(today)
     for task in tasks:
         task_id = task["id"]
@@ -245,10 +253,49 @@ def rehydrate_jobs(app) -> None:
             run_at_utc = run_at_local.astimezone(timezone.utc)
             if run_at_utc > now_utc:
                 _schedule_start_ping(app, task_id, run_at_utc)
+                rehydrated += 1
                 logger.info("Rehydrated start_ping for task %d at %s", task_id, task["planned_start"])
+            else:
+                # Bot was down through this task's start time — no ping will
+                # ever fire for it now unless someone notices and /at's it.
+                missed.append(f"start ping for \"{task['description']}\" ({task['planned_start']})")
 
         elif task["status"] == "started" and task["started_at"]:
             started = datetime.fromisoformat(task["started_at"])
             run_at_utc = started + timedelta(minutes=task["timer_minutes"])
             _schedule_endpoint_ping(app, task_id, run_at_utc)
+            rehydrated += 1
             logger.info("Rehydrated endpoint_ping for task %d (fires at %s)", task_id, run_at_utc)
+
+    logger.info(
+        "Rehydration complete: %d job(s) restored, %d missed window(s)",
+        rehydrated, len(missed),
+    )
+    if missed:
+        text = "⚠️ Restarted and missed:\n" + "\n".join(missed)
+        app.job_queue.run_once(_send_rehydrate_alert, when=5, data=text, name="rehydrate_alert")
+
+
+# ---------- daily-job self-heal (defense in depth vs. the self-rescheduling
+# morning/evening jobs silently vanishing, e.g. if a future bug reintroduces
+# the failure-breaks-the-chain problem) ----------
+
+async def check_daily_jobs_scheduled(context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    names = {job.name for job in app.job_queue.jobs()}
+    recovered = []
+
+    if "morning_scheduled" not in names:
+        schedule_morning(app)
+        recovered.append("morning")
+    if "evening_scheduled" not in names:
+        schedule_evening(app)
+        recovered.append("evening")
+
+    if recovered:
+        logger.error("Daily job(s) missing, rescheduled: %s", recovered)
+        if config.CHAT_ID:
+            await context.bot.send_message(
+                chat_id=config.CHAT_ID,
+                text=f"⚠️ Recovered missing daily job(s): {', '.join(recovered)}. Rescheduled for the next occurrence.",
+            )

@@ -26,13 +26,15 @@ from handlers import (
     cmd_help,
     cmd_lesson,
     cmd_lessons,
+    cmd_weekly,
+    cmd_trends,
     cmd_todo,
     cmd_at,
     cmd_begin,
     handle_text,
     handle_callback,
 )
-from jobs import schedule_morning, schedule_evening, rehydrate_jobs
+from jobs import schedule_morning, schedule_evening, rehydrate_jobs, check_daily_jobs_scheduled
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,6 +56,8 @@ async def _post_init(app) -> None:
         BotCommand("done",          "Lock in your morning plan"),
         BotCommand("lesson",        "Log a lesson learned"),
         BotCommand("lessons",       "View past lessons"),
+        BotCommand("weekly",        "Weekly review: done/missed/stuck + lessons"),
+        BotCommand("trends",        "Estimate vs. actual time trends"),
         BotCommand("help",          "Show all commands"),
     ])
 
@@ -78,6 +82,8 @@ def main() -> None:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("lesson", cmd_lesson))
     app.add_handler(CommandHandler("lessons", cmd_lessons))
+    app.add_handler(CommandHandler("weekly", cmd_weekly))
+    app.add_handler(CommandHandler("trends", cmd_trends))
     app.add_handler(CommandHandler("todo", cmd_todo))
     app.add_handler(CommandHandler("at", cmd_at))
     app.add_handler(CommandHandler("begin", cmd_begin))
@@ -96,6 +102,9 @@ def main() -> None:
     # --- daily prompts (self-rescheduling run_once, avoids APScheduler TZ issues) ---
     schedule_morning(app)
     schedule_evening(app)
+
+    # --- hourly self-heal: catch the morning/evening job silently vanishing ---
+    app.job_queue.run_repeating(check_daily_jobs_scheduled, interval=3600, first=3600, name="daily_jobs_healthcheck")
 
     # --- rehydrate today's one-shot jobs after a restart ---
     rehydrate_jobs(app)

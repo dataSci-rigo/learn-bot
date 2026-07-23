@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from collections import Counter
 from datetime import datetime, timezone, timedelta
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -125,6 +126,8 @@ Evening ping → tell me how it went.
 /done — lock in your morning plan
 /lesson — log a lesson learned
 /lessons — view past lessons
+/weekly — weekly review: done/missed/stuck + lessons
+/trends — estimate vs. actual time trends
 /help — show this message
 """
 
@@ -526,18 +529,40 @@ def _cancel_job(context: ContextTypes.DEFAULT_TYPE, name: str) -> None:
             job.schedule_removal()
 
 
-async def _complete_started_task(update: Update, context: ContextTypes.DEFAULT_TYPE, task: dict) -> None:
-    """Mark a 'started' task done immediately (early finish), same as the
-    endpoint-ping 'Done' button, then ask for actual time spent."""
-    task_id = task["id"]
+def _mark_task_done(context: ContextTypes.DEFAULT_TYPE, task_id: int) -> None:
+    """Core DB + job-cancellation side effects of finishing a started task.
+    No messaging — callers own the reply since they differ (plain message
+    vs. inline keyboard callback)."""
     now_utc = _utc_now()
     db.update_task_status(task_id, "done", completed_at=now_utc.isoformat())
     db.log_event("task_done", task_id=task_id)
     _cancel_job(context, f"endpoint_ping_{task_id}")
-    await update.message.reply_text(f"One down: {task['description']}.")
+
+
+async def _ask_actual_time(context: ContextTypes.DEFAULT_TYPE, chat_id: int, task_id: int) -> None:
     context.user_data["awaiting_actual_time_task_id"] = task_id
-    msg = await update.message.reply_text("How long did that actually take? (minutes, or /skip)")
+    msg = await context.bot.send_message(chat_id=chat_id, text="How long did that actually take? (minutes, or /skip)")
     context.user_data["awaiting_actual_time_msg_id"] = msg.message_id
+
+
+async def _complete_started_task(update: Update, context: ContextTypes.DEFAULT_TYPE, task: dict) -> None:
+    """Mark a 'started' task done immediately (early finish), same as the
+    endpoint-ping 'Done' button, then ask for actual time spent."""
+    task_id = task["id"]
+    _mark_task_done(context, task_id)
+    await update.message.reply_text(f"One down: {task['description']}.")
+    await _ask_actual_time(context, update.effective_chat.id, task_id)
+
+
+def _running_task_keyboard(tasks: list) -> InlineKeyboardMarkup:
+    buttons = []
+    for t in tasks:
+        label = t["description"]
+        if t["started_at"]:
+            started_local = datetime.fromisoformat(t["started_at"]).astimezone(config.TZ).strftime("%H:%M")
+            label += f" (started {started_local})"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"finish_task:{t['id']}")])
+    return InlineKeyboardMarkup(buttons)
 
 
 # ---------- /done (finish a running task, or lock morning plan) ----------
@@ -548,8 +573,14 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     today = _today()
 
     started = [t for t in db.get_tasks_for_date(today) if t["status"] == "started"]
-    if started:
+    if len(started) == 1:
         await _complete_started_task(update, context, started[0])
+        return
+    if len(started) > 1:
+        await update.message.reply_text(
+            "Multiple timers running — which one did you finish?",
+            reply_markup=_running_task_keyboard(started),
+        )
         return
 
     state = db.get_day_state(today)
@@ -608,6 +639,92 @@ async def cmd_lessons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             parts.append(f"💡 {lesson['learning']}")
         parts.append("")
     await update.message.reply_text("\n".join(parts).strip(), parse_mode="Markdown")
+
+
+# ---------- /weekly ----------
+
+_STATUS_ICON = {
+    "done": "✓", "missed": "✗", "skipped": "–", "stuck": "?",
+    "started": "▶", "planned": "○",
+}
+
+
+async def cmd_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        return
+    end = _local_now().date()
+    start = end - timedelta(days=6)
+    tasks = db.get_tasks_for_range(start.isoformat(), end.isoformat())
+    lessons = db.get_lessons_for_range(start.isoformat(), end.isoformat())
+    db.log_event("command", payload="/weekly")
+
+    if not tasks:
+        await update.message.reply_text(f"No tasks logged {start.isoformat()}–{end.isoformat()}.")
+        return
+
+    counts = Counter(t["status"] for t in tasks)
+    total = len(tasks)
+    lines = [f"*Week of {start.isoformat()} – {end.isoformat()}*", ""]
+    lines.append(f"{total} task(s): " + ", ".join(
+        f"{_STATUS_ICON.get(s, '○')} {counts[s]} {s}" for s in
+        ("done", "missed", "skipped", "stuck") if counts.get(s)
+    ))
+
+    stuck = [t for t in tasks if t["status"] == "stuck"]
+    if stuck:
+        lines.append("\n*Stuck on:*")
+        for t in stuck:
+            lines.append(f"– {t['description']} ({t['date']})")
+        lines.append("What made these different from the ones that got done?")
+
+    if lessons:
+        lines.append("\n*Lessons this week:*")
+        for lesson in lessons:
+            lines.append(f"*{lesson['date']}* — {lesson['went_well']}")
+            if lesson["learning"]:
+                lines.append(f"  💡 {lesson['learning']}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ---------- /trends ----------
+
+async def cmd_trends(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        return
+    tasks = db.get_tasks_with_actuals(limit=200)
+    db.log_event("command", payload="/trends")
+
+    if not tasks:
+        await update.message.reply_text(
+            "No completed tasks with a logged actual time yet — that gets recorded "
+            "when you answer 'How long did that actually take?' after finishing a task."
+        )
+        return
+
+    user_diffs = [(t["actual_minutes"] - t["user_estimate_minutes"], t) for t in tasks if t["user_estimate_minutes"]]
+    ai_diffs = [(t["actual_minutes"] - t["ai_estimate_minutes"], t) for t in tasks if t["ai_estimate_minutes"]]
+
+    lines = [f"*Estimate accuracy* (last {len(tasks)} completed task(s) with logged time)"]
+
+    if user_diffs:
+        avg = sum(d for d, _ in user_diffs) / len(user_diffs)
+        direction = "underestimate" if avg > 0 else "overestimate"
+        lines.append(f"\nYour estimates: you {direction} by {abs(avg):.0f} min on average ({len(user_diffs)} task(s)).")
+        worst = sorted(user_diffs, key=lambda x: -abs(x[0]))[:3]
+        for d, t in worst:
+            sign = "+" if d >= 0 else ""
+            lines.append(f"  {t['description']} — est {t['user_estimate_minutes']}, actual {t['actual_minutes']} ({sign}{d})")
+
+    if ai_diffs:
+        avg = sum(d for d, _ in ai_diffs) / len(ai_diffs)
+        direction = "underestimates" if avg > 0 else "overestimates"
+        lines.append(f"\nAI {direction} by {abs(avg):.0f} min on average ({len(ai_diffs)} task(s)).")
+
+    if not user_diffs and not ai_diffs:
+        lines.append("\nNo estimates logged alongside actual times yet.")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def handle_lesson_response(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -838,6 +955,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     now_utc = _utc_now()
 
+    if action == "finish_task":
+        if task["status"] != "started":
+            await query.edit_message_text(f"Already {task['status']}.")
+            return
+        _mark_task_done(context, task_id)
+        await query.edit_message_text(f"One down: {task['description']}.")
+        await _ask_actual_time(context, query.message.chat_id, task_id)
+        return
+
     # --- start ping responses ---
     if action == "start_yes":
         if task["status"] != "planned":
@@ -872,15 +998,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if task["status"] != "started":
             await query.edit_message_text(f"Already {task['status']}.")
             return
-        db.update_task_status(task_id, "done", completed_at=now_utc.isoformat())
-        db.log_event("task_done", task_id=task_id)
+        _mark_task_done(context, task_id)
         await query.edit_message_text("One down.")
-        context.user_data["awaiting_actual_time_task_id"] = task_id
-        msg = await context.bot.send_message(
-            chat_id=config.CHAT_ID,
-            text="How long did that actually take? (minutes, or /skip)",
-        )
-        context.user_data["awaiting_actual_time_msg_id"] = msg.message_id
+        await _ask_actual_time(context, query.message.chat_id, task_id)
 
     elif action == "end_more":
         if task["status"] != "started":

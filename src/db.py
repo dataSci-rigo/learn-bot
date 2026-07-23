@@ -130,6 +130,24 @@ def get_tasks_for_date(date: str) -> list[sqlite3.Row]:
         ).fetchall()
 
 
+def get_tasks_for_range(start_date: str, end_date: str) -> list[sqlite3.Row]:
+    with _conn() as con:
+        return con.execute(
+            "SELECT * FROM tasks WHERE date BETWEEN ? AND ? ORDER BY date, id",
+            (start_date, end_date),
+        ).fetchall()
+
+
+def get_tasks_with_actuals(limit: int = 200) -> list[sqlite3.Row]:
+    """Tasks that have a logged actual_minutes, most recent first."""
+    with _conn() as con:
+        return con.execute(
+            """SELECT * FROM tasks WHERE actual_minutes IS NOT NULL
+               ORDER BY date DESC, id DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+
+
 def get_task(task_id: int) -> sqlite3.Row | None:
     with _conn() as con:
         return con.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
@@ -211,4 +229,12 @@ def get_lessons(limit: int = 10) -> list[sqlite3.Row]:
         return con.execute(
             "SELECT * FROM lessons ORDER BY created_at DESC LIMIT ?",
             (limit,),
+        ).fetchall()
+
+
+def get_lessons_for_range(start_date: str, end_date: str) -> list[sqlite3.Row]:
+    with _conn() as con:
+        return con.execute(
+            "SELECT * FROM lessons WHERE date BETWEEN ? AND ? ORDER BY date",
+            (start_date, end_date),
         ).fetchall()
